@@ -1,557 +1,295 @@
-"""
-A* grid planning 2D/3D avec support d'obstacles
-
-author: Atsushi Sakai(@Atsushi_twi)
-        Nikos Kanargias (nkana@tee.gr)
-        Modifié pour support 3D et obstacles personnalisés
-
-See Wikipedia article (https://en.wikipedia.org/wiki/A*_search_algorithm)
-"""
-
-import math
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
-from obstacles import ObstacleManager, CircleObstacle, RectangleObstacle, SphereObstacle, BoxObstacle
+from casadi import MX, vertcat, sqrt, sum1, sum2, jacobian
+from abc import ABC, abstractmethod
+import casadi
 
-show_animation = True
-
-
-class AStarPlanner3D:
-
-    def __init__(self, resolution, rr, obstacle_manager=None, is_3d=False, bounds=None):
+class ObstacleBase(ABC):
+    """Classe de base pour tous les obstacles"""
+    
+    def __init__(self, name="obstacle"):
+        self.name = name
+        self.enabled = True
+        
+    @abstractmethod
+    def get_constraint(self, x, y, z=None):
+        """Retourne la contrainte symbolique pour cet obstacle
+        
+        Args:
+            x, y, z: Variables symboliques CasADi représentant la position
+            
+        Returns:
+            constraint: Expression CasADi où constraint >= 0 signifie hors obstacle
         """
-        Initialize grid map for A* planning
-
-        resolution: grid resolution [m]
-        rr: robot radius[m]
-        obstacle_manager: Instance of ObstacleManager
-        is_3d: True for 3D planning, False for 2D
-        bounds: Dict with bounds {'x_min': val, 'x_max': val, 'y_min': val, 'y_max': val, 'z_min': val, 'z_max': val}
+        pass
+    
+    @abstractmethod
+    def get_bounds(self):
+        """Retourne les bornes pour cette contrainte
+        
+        Returns:
+            (lower_bound, upper_bound): Tuple des bornes
         """
-        self.resolution = resolution
-        self.rr = rr
-        self.is_3d = is_3d
-        self.obstacle_manager = obstacle_manager if obstacle_manager else ObstacleManager()
+        pass
+    
+    def enable(self):
+        """Active cet obstacle"""
+        self.enabled = True
         
-        # Bornes par défaut
-        if bounds is None:
-            self.bounds = {
-                'x_min': -10.0, 'x_max': 60.0,
-                'y_min': -10.0, 'y_max': 60.0,
-                'z_min': 0.0, 'z_max': 20.0
-            }
-        else:
-            self.bounds = bounds
-            
-        self.min_x = self.bounds['x_min']
-        self.max_x = self.bounds['x_max']
-        self.min_y = self.bounds['y_min']
-        self.max_y = self.bounds['y_max']
+    def disable(self):
+        """Désactive cet obstacle"""
+        self.enabled = False
+
+
+class CircleObstacle(ObstacleBase):
+    """Obstacle circulaire en 2D"""
+    
+    def __init__(self, center_x, center_y, radius, name="circle"):
+        super().__init__(name)
+        self.center_x = center_x
+        self.center_y = center_y
+        self.radius = radius
         
-        if self.is_3d:
-            self.min_z = self.bounds['z_min']
-            self.max_z = self.bounds['z_max']
-            self.z_width = round((self.max_z - self.min_z) / self.resolution)
+    def get_constraint(self, x, y, z=None):
+        """Contrainte: (x-cx)² + (y-cy)² >= r²"""
+        dx = x - self.center_x
+        dy = y - self.center_y
+        return dx**2 + dy**2 - self.radius**2
+    
+    def get_bounds(self):
+        """Pour un obstacle dur, on veut constraint >= 0"""
+        return (0.0, np.inf)
+    
+    def update_params(self, center_x=None, center_y=None, radius=None):
+        """Met à jour les paramètres de l'obstacle"""
+        if center_x is not None:
+            self.center_x = center_x
+        if center_y is not None:
+            self.center_y = center_y
+        if radius is not None:
+            self.radius = radius
+
+
+class SphereObstacle(ObstacleBase):
+    """Obstacle sphérique en 3D"""
+    
+    def __init__(self, center_x, center_y, center_z, radius, name="sphere"):
+        super().__init__(name)
+        self.center_x = center_x
+        self.center_y = center_y
+        self.center_z = center_z
+        self.radius = radius
         
-        self.x_width = round((self.max_x - self.min_x) / self.resolution)
-        self.y_width = round((self.max_y - self.min_y) / self.resolution)
+    def get_constraint(self, x, y, z):
+        """Contrainte: (x-cx)² + (y-cy)² + (z-cz)² >= r²"""
+        dx = x - self.center_x
+        dy = y - self.center_y
+        dz = z - self.center_z
+        return dx**2 + dy**2 + dz**2 - self.radius**2
+    
+    def get_bounds(self):
+        return (0.0, np.inf)
+    
+    def update_params(self, center_x=None, center_y=None, center_z=None, radius=None):
+        if center_x is not None:
+            self.center_x = center_x
+        if center_y is not None:
+            self.center_y = center_y
+        if center_z is not None:
+            self.center_z = center_z
+        if radius is not None:
+            self.radius = radius
+
+
+class RectangleObstacle(ObstacleBase):
+    """Obstacle rectangulaire en 2D"""
+    
+    def __init__(self, x_min, x_max, y_min, y_max, name="rectangle"):
+        super().__init__(name)
+        self.x_min = x_min
+        self.x_max = x_max
+        self.y_min = y_min
+        self.y_max = y_max
         
-        self.motion = self.get_motion_model()
-        self.obstacle_map = self.calc_obstacle_map()
+    def get_constraint(self, x, y, z=None):
+        """Contrainte: point à l'extérieur du rectangle
+        Utilise la distance signée au rectangle"""
+        # Distance au rectangle (négative si à l'intérieur)
+        dx = MX.fmax(MX.fmax(self.x_min - x, 0), MX.fmax(x - self.x_max, 0))
+        dy = MX.fmax(MX.fmax(self.y_min - y, 0), MX.fmax(y - self.y_max, 0))
+        return dx**2 + dy**2
+    
+    def get_bounds(self):
+        return (1e-6, np.inf)  # Petite valeur positive pour éviter d'être exactement sur le bord
+    
+    def update_params(self, x_min=None, x_max=None, y_min=None, y_max=None):
+        if x_min is not None:
+            self.x_min = x_min
+        if x_max is not None:
+            self.x_max = x_max
+        if y_min is not None:
+            self.y_min = y_min
+        if y_max is not None:
+            self.y_max = y_max
 
-    class Node:
-        def __init__(self, x, y, z, cost, parent_index):
-            self.x = x  # index of grid
-            self.y = y  # index of grid
-            self.z = z  # index of grid (None for 2D)
-            self.cost = cost
-            self.parent_index = parent_index
 
-        def __str__(self):
-            if self.z is not None:
-                return f"{self.x},{self.y},{self.z},{self.cost},{self.parent_index}"
-            else:
-                return f"{self.x},{self.y},{self.cost},{self.parent_index}"
-
-    def planning(self, sx, sy, sz, gx, gy, gz):
-        """
-        A star path search
-
-        input:
-            sx, sy, sz: start position [m] (sz can be None for 2D)
-            gx, gy, gz: goal position [m] (gz can be None for 2D)
-
-        output:
-            rx, ry, rz: position lists of the final path (rz is None for 2D)
-        """
+class BoxObstacle(ObstacleBase):
+    """Obstacle parallélépipédique en 3D"""
+    
+    def __init__(self, x_min, x_max, y_min, y_max, z_min, z_max, name="box"):
+        super().__init__(name)
+        self.x_min = x_min
+        self.x_max = x_max
+        self.y_min = y_min
+        self.y_max = y_max
+        self.z_min = z_min
+        self.z_max = z_max
         
-        if not self.is_3d:
-            sz = gz = None
-            
-        start_node = self.Node(
-            self.calc_xy_index(sx, self.min_x),
-            self.calc_xy_index(sy, self.min_y),
-            self.calc_xy_index(sz, self.min_z) if self.is_3d else None,
-            0.0, -1
-        )
+    def get_constraint(self, x, y, z):
+        """Contrainte: point à l'extérieur du parallélépipède"""
+        dx = MX.fmax(MX.fmax(self.x_min - x, 0), MX.fmax(x - self.x_max, 0))
+        dy = MX.fmax(MX.fmax(self.y_min - y, 0), MX.fmax(y - self.y_max, 0))
+        dz = MX.fmax(MX.fmax(self.z_min - z, 0), MX.fmax(z - self.z_max, 0))
+        return dx**2 + dy**2 + dz**2
+    
+    def get_bounds(self):
+        return (1e-6, np.inf)
+    
+    def update_params(self, x_min=None, x_max=None, y_min=None, y_max=None, 
+                     z_min=None, z_max=None):
+        if x_min is not None:
+            self.x_min = x_min
+        if x_max is not None:
+            self.x_max = x_max
+        if y_min is not None:
+            self.y_min = y_min
+        if y_max is not None:
+            self.y_max = y_max
+        if z_min is not None:
+            self.z_min = z_min
+        if z_max is not None:
+            self.z_max = z_max
+
+class ObstacleManager:
+    """Gestionnaire des obstacles pour le MPC"""
+    
+    def __init__(self):
+        self.obstacles = []
         
-        goal_node = self.Node(
-            self.calc_xy_index(gx, self.min_x),
-            self.calc_xy_index(gy, self.min_y),
-            self.calc_xy_index(gz, self.min_z) if self.is_3d else None,
-            0.0, -1
-        )
-
-        open_set, closed_set = dict(), dict()
-        open_set[self.calc_grid_index(start_node)] = start_node
-
-        while True:
-            if len(open_set) == 0:
-                print("Open set is empty..")
-                break
-
-            c_id = min(
-                open_set,
-                key=lambda o: open_set[o].cost + self.calc_heuristic(goal_node, open_set[o]))
-            current = open_set[c_id]
-
-            # show graph
-            if show_animation and not self.is_3d:  # Affichage 2D seulement
-                plt.plot(self.calc_grid_position(current.x, self.min_x),
-                         self.calc_grid_position(current.y, self.min_y), "xc")
-                plt.gcf().canvas.mpl_connect('key_release_event',
-                                             lambda event: [exit(0) if event.key == 'escape' else None])
-                if len(closed_set.keys()) % 10 == 0:
-                    plt.pause(0.001)
-
-            if self.is_goal(current, goal_node):
-                print("Find goal")
-                goal_node.parent_index = current.parent_index
-                goal_node.cost = current.cost
-                break
-
-            # Remove the item from the open set
-            del open_set[c_id]
-
-            # Add it to the closed set
-            closed_set[c_id] = current
-
-            # expand search grid based on motion model
-            for motion in self.motion:
-                if self.is_3d:
-                    node = self.Node(
-                        current.x + motion[0],
-                        current.y + motion[1],
-                        current.z + motion[2],
-                        current.cost + motion[3], c_id
-                    )
-                else:
-                    node = self.Node(
-                        current.x + motion[0],
-                        current.y + motion[1],
-                        None,
-                        current.cost + motion[2], c_id
-                    )
-                    
-                n_id = self.calc_grid_index(node)
-
-                # If the node is not safe, do nothing
-                if not self.verify_node(node):
-                    continue
-
-                if n_id in closed_set:
-                    continue
-
-                if n_id not in open_set:
-                    open_set[n_id] = node  # discovered a new node
-                else:
-                    if open_set[n_id].cost > node.cost:
-                        # This path is the best until now. record it
-                        open_set[n_id] = node
-
-        rx, ry, rz = self.calc_final_path(goal_node, closed_set)
-        return rx, ry, rz
-
-    def is_goal(self, current, goal):
-        """Vérifie si le noeud courant est le noeud objectif"""
-        if self.is_3d:
-            return (current.x == goal.x and 
-                   current.y == goal.y and 
-                   current.z == goal.z)
-        else:
-            return (current.x == goal.x and 
-                   current.y == goal.y)
-
-    def calc_final_path(self, goal_node, closed_set):
-        """Calcule le chemin final"""
-        rx = [self.calc_grid_position(goal_node.x, self.min_x)]
-        ry = [self.calc_grid_position(goal_node.y, self.min_y)]
-        rz = [self.calc_grid_position(goal_node.z, self.min_z)] if self.is_3d else None
-        
-        parent_index = goal_node.parent_index
-        while parent_index != -1:
-            n = closed_set[parent_index]
-            rx.append(self.calc_grid_position(n.x, self.min_x))
-            ry.append(self.calc_grid_position(n.y, self.min_y))
-            if self.is_3d:
-                rz.append(self.calc_grid_position(n.z, self.min_z))
-            parent_index = n.parent_index
-
-        return rx, ry, rz
-
-    def calc_heuristic(self, n1, n2):
-        """Calcule l'heuristique (distance euclidienne)"""
-        w = 1.0  # weight of heuristic
-        if self.is_3d:
-            d = w * math.sqrt((n1.x - n2.x)**2 + (n1.y - n2.y)**2 + (n1.z - n2.z)**2)
-        else:
-            d = w * math.hypot(n1.x - n2.x, n1.y - n2.y)
-        return d
-
-    def calc_grid_position(self, index, min_position):
-        """Calcule la position dans la grille"""
-        if index is None:
-            return None
-        pos = index * self.resolution + min_position
-        return pos
-
-    def calc_xy_index(self, position, min_pos):
-        """Calcule l'index de la grille"""
-        if position is None:
-            return None
-        return round((position - min_pos) / self.resolution)
-
-    def calc_grid_index(self, node):
-        """Calcule l'index unique du noeud dans la grille"""
-        if self.is_3d:
-            return ((node.z - (0 if self.min_z == 0 else round(self.min_z / self.resolution))) * 
-                    self.x_width * self.y_width + 
-                    (node.y - round(self.min_y / self.resolution)) * self.x_width + 
-                    (node.x - round(self.min_x / self.resolution)))
-        else:
-            return ((node.y - round(self.min_y / self.resolution)) * self.x_width + 
-                    (node.x - round(self.min_x / self.resolution)))
-
-    def verify_node(self, node):
-        """Vérifie si un noeud est valide"""
-        px = self.calc_grid_position(node.x, self.min_x)
-        py = self.calc_grid_position(node.y, self.min_y)
-        
-        # Vérification des bornes
-        if px < self.min_x or px >= self.max_x:
-            return False
-        if py < self.min_y or py >= self.max_y:
-            return False
-            
-        if self.is_3d:
-            pz = self.calc_grid_position(node.z, self.min_z)
-            if pz < self.min_z or pz >= self.max_z:
-                return False
-            
-            # Collision check 3D
-            if self.obstacle_map[node.x][node.y][node.z]:
-                return False
-        else:
-            # Collision check 2D
-            if self.obstacle_map[node.x][node.y]:
-                return False
-
-        return True
-
-    def calc_obstacle_map(self):
-        """Calcule la carte des obstacles en utilisant l'ObstacleManager"""
-        print(f"Calcul de la carte d'obstacles {'3D' if self.is_3d else '2D'}...")
-        print(f"Dimensions: x={self.x_width}, y={self.y_width}" + 
-              (f", z={self.z_width}" if self.is_3d else ""))
-        
-        if self.is_3d:
-            # Créer la carte 3D
-            obstacle_map = [[[False for _ in range(self.z_width)]
-                            for _ in range(self.y_width)]
-                           for _ in range(self.x_width)]
-            
-            for ix in range(self.x_width):
-                x = self.calc_grid_position(ix, self.min_x)
-                for iy in range(self.y_width):
-                    y = self.calc_grid_position(iy, self.min_y)
-                    for iz in range(self.z_width):
-                        z = self.calc_grid_position(iz, self.min_z)
-                        if self.is_point_in_obstacle(x, y, z):
-                            obstacle_map[ix][iy][iz] = True
-        else:
-            # Créer la carte 2D
-            obstacle_map = [[False for _ in range(self.y_width)]
-                           for _ in range(self.x_width)]
-            
-            for ix in range(self.x_width):
-                x = self.calc_grid_position(ix, self.min_x)
-                for iy in range(self.y_width):
-                    y = self.calc_grid_position(iy, self.min_y)
-                    if self.is_point_in_obstacle(x, y, None):
-                        obstacle_map[ix][iy] = True
-        
-        return obstacle_map
-
-    def is_point_in_obstacle(self, x, y, z):
-        """Vérifie si un point est dans un obstacle en tenant compte du rayon du robot"""
-        for obstacle in self.obstacle_manager.get_active_obstacles():
-            # Créer un point étendu par le rayon du robot
-            if self.is_3d and z is not None:
-                # Pour les obstacles 3D
-                if hasattr(obstacle, 'center_z'):  # SphereObstacle ou BoxObstacle
-                    if isinstance(obstacle, SphereObstacle):
-                        # Distance au centre de la sphère
-                        dist = math.sqrt((x - obstacle.center_x)**2 + 
-                                       (y - obstacle.center_y)**2 + 
-                                       (z - obstacle.center_z)**2)
-                        if dist <= obstacle.radius + self.rr:
-                            return True
-                    elif isinstance(obstacle, BoxObstacle):
-                        # Vérifier si le point étendu par le rayon du robot intersecte la boîte
-                        if (x + self.rr >= obstacle.x_min and x - self.rr <= obstacle.x_max and
-                            y + self.rr >= obstacle.y_min and y - self.rr <= obstacle.y_max and
-                            z + self.rr >= obstacle.z_min and z - self.rr <= obstacle.z_max):
-                            return True
-                else:
-                    # Obstacle 2D dans un espace 3D (projeter sur z)
-                    if isinstance(obstacle, CircleObstacle):
-                        dist = math.sqrt((x - obstacle.center_x)**2 + (y - obstacle.center_y)**2)
-                        if dist <= obstacle.radius + self.rr:
-                            return True
-                    elif isinstance(obstacle, RectangleObstacle):
-                        if (x + self.rr >= obstacle.x_min and x - self.rr <= obstacle.x_max and
-                            y + self.rr >= obstacle.y_min and y - self.rr <= obstacle.y_max):
-                            return True
-            else:
-                # Pour les obstacles 2D
-                if isinstance(obstacle, CircleObstacle):
-                    dist = math.sqrt((x - obstacle.center_x)**2 + (y - obstacle.center_y)**2)
-                    if dist <= obstacle.radius + self.rr:
-                        return True
-                elif isinstance(obstacle, RectangleObstacle):
-                    if (x + self.rr >= obstacle.x_min and x - self.rr <= obstacle.x_max and
-                        y + self.rr >= obstacle.y_min and y - self.rr <= obstacle.y_max):
-                        return True
-        
-        return False
-
-    def get_motion_model(self):
-        """Modèle de mouvement pour 2D ou 3D"""
-        if self.is_3d:
-            # Mouvement 3D - 26 directions (sans rester sur place)
-            motion = []
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    for dz in [-1, 0, 1]:
-                        if dx == 0 and dy == 0 and dz == 0:
-                            continue  # Pas de mouvement sur place
-                        
-                        # Calcul du coût (distance euclidienne)
-                        cost = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        motion.append([dx, dy, dz, cost])
-            return motion
-        else:
-            # Mouvement 2D - 8 directions
-            motion = [[1, 0, 1],
-                      [0, 1, 1],
-                      [-1, 0, 1],
-                      [0, -1, 1],
-                      [-1, -1, math.sqrt(2)],
-                      [-1, 1, math.sqrt(2)],
-                      [1, -1, math.sqrt(2)],
-                      [1, 1, math.sqrt(2)]]
-            return motion
-
     def add_obstacle(self, obstacle):
-        """Ajoute un obstacle et recalcule la carte"""
-        self.obstacle_manager.add_obstacle(obstacle)
-        self.obstacle_map = self.calc_obstacle_map()
-
+        """Ajoute un obstacle"""
+        self.obstacles.append(obstacle)
+        
     def remove_obstacle(self, obstacle_name):
-        """Supprime un obstacle et recalcule la carte"""
-        self.obstacle_manager.remove_obstacle(obstacle_name)
-        self.obstacle_map = self.calc_obstacle_map()
-
-    def visualize_2d(self, rx=None, ry=None, sx=None, sy=None, gx=None, gy=None):
-        """Visualisation 2D"""
-        if self.is_3d:
-            print("Visualisation 2D non disponible pour le mode 3D")
-            return
+        """Supprime un obstacle par nom"""
+        self.obstacles = [obs for obs in self.obstacles if obs.name != obstacle_name]
+        
+    def clear_obstacles(self):
+        """Supprime tous les obstacles"""
+        self.obstacles = []
+        
+    def get_obstacle(self, name):
+        """Récupère un obstacle par nom"""
+        for obs in self.obstacles:
+            if obs.name == name:
+                return obs
+        return None
+        
+    def get_constraints(self, state_vars, position_indices):
+        """Génère toutes les contraintes d'obstacles
+        
+        Args:
+            state_vars: Variables d'état symboliques CasADi
+            position_indices: Dict avec les indices des positions {'x': idx, 'y': idx, 'z': idx}
             
-        plt.figure(figsize=(10, 10))
+        Returns:
+            constraints: Liste des contraintes symboliques
+            bounds: Liste des tuples (lower_bound, upper_bound)
+        """
+        constraints = []
+        bounds = []
         
-        # Afficher les obstacles
-        for obstacle in self.obstacle_manager.get_active_obstacles():
-            if isinstance(obstacle, CircleObstacle):
-                circle = plt.Circle((obstacle.center_x, obstacle.center_y), 
-                                  obstacle.radius, color='black', alpha=0.5)
-                plt.gca().add_patch(circle)
-            elif isinstance(obstacle, RectangleObstacle):
-                rect = plt.Rectangle((obstacle.x_min, obstacle.y_min),
-                                   obstacle.x_max - obstacle.x_min,
-                                   obstacle.y_max - obstacle.y_min,
-                                   color='black', alpha=0.5)
-                plt.gca().add_patch(rect)
-        
-        # Afficher le chemin
-        if rx and ry:
-            plt.plot(rx, ry, "-r", linewidth=2, label="Path")
-        
-        # Afficher start et goal
-        if sx is not None and sy is not None:
-            plt.plot(sx, sy, "og", markersize=10, label="Start")
-        if gx is not None and gy is not None:
-            plt.plot(gx, gy, "xb", markersize=10, label="Goal")
-        
-        plt.grid(True)
-        plt.axis("equal")
-        plt.legend()
-        plt.xlim(self.min_x, self.max_x)
-        plt.ylim(self.min_y, self.max_y)
-        plt.show()
-
-    def visualize_3d(self, rx=None, ry=None, rz=None, sx=None, sy=None, sz=None, 
-                     gx=None, gy=None, gz=None):
-        """Visualisation 3D"""
-        if not self.is_3d:
-            print("Visualisation 3D non disponible pour le mode 2D")
-            return
+        for obstacle in self.obstacles:
+            if not obstacle.enabled:
+                continue
+                
+            # Extraction des variables de position
+            x = state_vars[position_indices['x']]
+            y = state_vars[position_indices['y']]
+            z = None
+            if 'z' in position_indices and position_indices['z'] is not None:
+                z = state_vars[position_indices['z']]
+            # Génération de la contrainte
+            constraint = obstacle.get_constraint(x, y, z)
+            bound = obstacle.get_bounds()
             
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # Afficher les obstacles 3D
-        for obstacle in self.obstacle_manager.get_active_obstacles():
-            if isinstance(obstacle, SphereObstacle):
-                # Dessiner une sphère
-                u = np.linspace(0, 2 * np.pi, 50)
-                v = np.linspace(0, np.pi, 50)
-                x_sphere = obstacle.radius * np.outer(np.cos(u), np.sin(v)) + obstacle.center_x
-                y_sphere = obstacle.radius * np.outer(np.sin(u), np.sin(v)) + obstacle.center_y
-                z_sphere = obstacle.radius * np.outer(np.ones(np.size(u)), np.cos(v)) + obstacle.center_z
-                ax.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
-            elif isinstance(obstacle, BoxObstacle):
-                # Dessiner un parallélépipède
-                from itertools import product, combinations
-                r = [obstacle.x_min, obstacle.x_max]
-                s = [obstacle.y_min, obstacle.y_max]
-                t = [obstacle.z_min, obstacle.z_max]
-                for s, e in combinations(np.array(list(product(r, s, t))), 2):
-                    if np.sum(np.abs(s-e)) == abs(r[1]-r[0]) or np.sum(np.abs(s-e)) == abs(s[1]-s[0]) or np.sum(np.abs(s-e)) == abs(t[1]-t[0]):
-                        ax.plot3D(*zip(s, e), color="red", alpha=0.6)
-        
-        # Afficher le chemin
-        if rx and ry and rz:
-            ax.plot(rx, ry, rz, "-r", linewidth=3, label="Path")
-        
-        # Afficher start et goal
-        if sx is not None and sy is not None and sz is not None:
-            ax.scatter([sx], [sy], [sz], c='green', s=100, label="Start")
-        if gx is not None and gy is not None and gz is not None:
-            ax.scatter([gx], [gy], [gz], c='blue', s=100, label="Goal")
-        
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.legend()
-        plt.show()
+            constraints.append(constraint)
+            bounds.append(bound)
+            
+        return constraints, bounds
+    
+    def get_active_obstacles(self):
+        """Retourne la liste des obstacles actifs"""
+        return [obs for obs in self.obstacles if obs.enabled]
+    
+    def get_obstacle_names(self):
+        """Retourne la liste des noms d'obstacles"""
+        return [obs.name for obs in self.obstacles]
+    
+        from casadi import jacobian
+    
+    def get_constraints_and_gradients(self, state_vars, state_lin, position_indices):
+        constraints = []
+        bounds = []
+        for obstacle in self.obstacles:
+            if not obstacle.enabled:
+                continue
+    
+            if 'z' in position_indices and position_indices['z'] is not None:
+                x_sym = MX.sym('x')
+                y_sym = MX.sym('y')
+                z_sym = MX.sym('z')
+                h_sym = obstacle.get_constraint(x_sym, y_sym, z_sym)
+                grad_h = [jacobian(h_sym, v) for v in [x_sym, y_sym, z_sym]]
+                x_lin = state_lin[position_indices['x']]
+                y_lin = state_lin[position_indices['y']]
+                z_lin = state_lin[position_indices['z']]
+                h_lin = obstacle.get_constraint(x_lin, y_lin, z_lin)
+                grad_h_val = casadi.substitute(grad_h, [x_sym, y_sym, z_sym], [x_lin, y_lin, z_lin])
+                x = state_vars[position_indices['x']]
+                y = state_vars[position_indices['y']]
+                z = state_vars[position_indices['z']]
+                lin_constraint = h_lin + sum([g * (v - v_lin) for g, v, v_lin in zip(grad_h_val, [x, y, z], [x_lin, y_lin, z_lin])])
+            else:
+                x_sym = MX.sym('x')
+                y_sym = MX.sym('y')
+                h_sym = obstacle.get_constraint(x_sym, y_sym)
+                grad_h = [jacobian(h_sym, v) for v in [x_sym, y_sym]]
+                x_lin = state_lin[position_indices['x']]
+                y_lin = state_lin[position_indices['y']]
+                h_lin = obstacle.get_constraint(x_lin, y_lin)
+                grad_h_val = casadi.substitute(grad_h, [x_sym, y_sym], [x_lin, y_lin])
+                x = state_vars[position_indices['x']]
+                y = state_vars[position_indices['y']]
+                lin_constraint = h_lin + sum([g * (v - v_lin) for g, v, v_lin in zip(grad_h_val, [x, y], [x_lin, y_lin])])
+    
+            constraints.append(lin_constraint)
+            bounds.append(obstacle.get_bounds())
+        return constraints, bounds
 
 
-def demo_2d():
-    """Démonstration en 2D"""
-    print("=== Démonstration A* 2D ===")
-    
-    # Configuration
-    grid_size = 1.0  # [m]
-    robot_radius = 0.5  # [m]
-    
-    # Créer le gestionnaire d'obstacles
-    obstacle_manager = ObstacleManager()
-    
-    # Ajouter quelques obstacles
-    obstacle_manager.add_obstacle(CircleObstacle(15, 15, 3, "circle1"))
-    obstacle_manager.add_obstacle(CircleObstacle(30, 30, 4, "circle2"))
-    obstacle_manager.add_obstacle(RectangleObstacle(20, 25, 40, 45, "rect1"))
-    obstacle_manager.add_obstacle(RectangleObstacle(35, 45, 10, 20, "rect2"))
-    
-    # Créer le planificateur 2D
-    planner = AStarPlanner3D(grid_size, robot_radius, obstacle_manager, is_3d=False)
-    
-    # Positions de départ et d'arrivée
-    sx, sy = 5.0, 5.0
-    gx, gy = 50.0, 50.0
-    
-    # Planification
-    print(f"Planning from ({sx}, {sy}) to ({gx}, {gy})")
-    rx, ry, rz = planner.planning(sx, sy, None, gx, gy, None)
-    
-    if rx:
-        print(f"Path found with {len(rx)} points")
-        planner.visualize_2d(rx, ry, sx, sy, gx, gy)
-    else:
-        print("No path found")
+# Fonctions utilitaires pour créer rapidement des obstacles
+def create_circle(center_x, center_y, radius, name="circle"):
+    """Crée un obstacle circulaire"""
+    return CircleObstacle(center_x, center_y, radius, name)
 
+def create_sphere(center_x, center_y, center_z, radius, name="sphere"):
+    """Crée un obstacle sphérique"""
+    return SphereObstacle(center_x, center_y, center_z, radius, name)
 
-def demo_3d():
-    """Démonstration en 3D"""
-    print("=== Démonstration A* 3D ===")
-    
-    # Configuration
-    grid_size = 2.0  # [m]
-    robot_radius = 1.0  # [m]
-    
-    # Créer le gestionnaire d'obstacles
-    obstacle_manager = ObstacleManager()
-    
-    # Ajouter quelques obstacles 3D
-    obstacle_manager.add_obstacle(SphereObstacle(15, 15, 10, 4, "sphere1"))
-    obstacle_manager.add_obstacle(SphereObstacle(35, 25, 8, 3, "sphere2"))
-    obstacle_manager.add_obstacle(BoxObstacle(20, 25, 30, 35, 5, 15, "box1"))
-    
-    # Créer le planificateur 3D
-    bounds = {'x_min': 0, 'x_max': 50, 'y_min': 0, 'y_max': 40, 'z_min': 0, 'z_max': 20}
-    planner = AStarPlanner3D(grid_size, robot_radius, obstacle_manager, is_3d=True, bounds=bounds)
-    
-    # Positions de départ et d'arrivée
-    sx, sy, sz = 5.0, 5.0, 2.0
-    gx, gy, gz = 45.0, 35.0, 18.0
-    
-    # Planification
-    print(f"Planning from ({sx}, {sy}, {sz}) to ({gx}, {gy}, {gz})")
-    rx, ry, rz = planner.planning(sx, sy, sz, gx, gy, gz)
-    
-    if rx:
-        print(f"Path found with {len(rx)} points")
-        # Affichage des premières coordonnées du chemin
-        for i in range(min(5, len(rx))):
-            print(f"Point {i}: ({rx[i]:.1f}, {ry[i]:.1f}, {rz[i]:.1f})")
-        
-        # Visualisation 3D (nécessite numpy pour la sphère)
-        try:
-            import numpy as np
-            planner.visualize_3d(rx, ry, rz, sx, sy, sz, gx, gy, gz)
-        except ImportError:
-            print("Numpy requis pour la visualisation 3D")
-    else:
-        print("No path found")
+def create_rectangle(x_min, x_max, y_min, y_max, name="rectangle"):
+    """Crée un obstacle rectangulaire"""
+    return RectangleObstacle(x_min, x_max, y_min, y_max, name)
 
-
-if __name__ == '__main__':
-    import sys
-    
-    print("Sélectionnez le mode:")
-    print("1: Démonstration 2D")
-    print("2: Démonstration 3D")
-    
-    try:
-        choice = input("Votre choix (1 ou 2): ")
-        if choice == "1":
-            demo_2d()
-        elif choice == "2":
-            demo_3d()
-        else:
-            print("Choix invalide, lancement de la démo 2D par défaut")
-            demo_2d()
-    except KeyboardInterrupt:
-        print("\nArrêt du programme")
+def create_box(x_min, x_max, y_min, y_max, z_min, z_max, name="box"):
+    """Crée un obstacle parallélépipédique"""
+    return BoxObstacle(x_min, x_max, y_min, y_max, z_min, z_max, name)
